@@ -1,0 +1,433 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to stream DynamoDB Data to DataLake Bucket
+  in different account
+Parameters:
+  CrossAccountDatalakeBucket:
+    Type: String
+    Description: S3 Datalake Cross Account Bucket Name for Delivery Stream to output data
+  ConsumerAccountID:
+    Type: String
+    Description: ID of the account where you are creating S3 Bucket
+    AllowedPattern: ^[0-9]{12}$
+  ArtifactBucket:
+    Type: String
+    Description: S3 Bucket containing artifacts required for the deployment
+    Default: aws-bigdata-blog
+  BlogTransformationLambdaFile:
+    Type: String
+    Description: S3 Key for the Lambda code that does the Firehose transformations
+    Default: artifacts/bdb1040-blog-kds-deployment-artifacts/lambda-scripts/firehose_transformation_lambda/firehose_transformation_lambda.zip
+  KMSKeyAlias:
+    Description: The alias for Datalake KMS key
+    Type: String
+    Default: blog-bdb1040-srca-prod-kms-key
+    AllowedPattern: ^(?!aws)([a-zA-Z0-9\-\_\/]){1,32}$
+    MinLength: 3
+    MaxLength: 32
+    ConstraintDescription: KMS key alias must be at least 3 and no more than 32
+      characters long, can contain lowercase and uppercase letters, numbers,
+      hyphens, underscores and forward slashes and cannot begin with aws.
+Resources:
+  DatalakeKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer managed key used for server-side encryption with DynamoDB
+        and Kinesis Data Streams
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: bdb1040-ddb-key-default
+        Statement:
+          - Sid: Give AWS account:root full control over the KMS key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+  DatalakeKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${KMSKeyAlias}
+      TargetKeyId: !Ref DatalakeKmsKey
+  BlogKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: blog-srca-ddb-table-data-stream
+      ShardCount: 10
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref DatalakeKmsKey
+  BlogDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      KinesisStreamSpecification:
+        StreamArn: !GetAtt BlogKinesisStream.Arn
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: name
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: name
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt DatalakeKmsKey.Arn
+      TableName: blog-srca-ddb-table
+  DDBVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+  DDBVpcIsolatedSubnet1Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/17
+      VpcId: !Ref DDBVpc
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: false
+  DDBVpcIsolatedSubnet1RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DDBVpc
+  DDBVpcIsolatedSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DDBVpcIsolatedSubnet1RouteTable
+      SubnetId: !Ref DDBVpcIsolatedSubnet1Subnet
+  DDBVpcIsolatedSubnet2Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.128.0/17
+      VpcId: !Ref DDBVpc
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      MapPublicIpOnLaunch: false
+  DDBVpcIsolatedSubnet2RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DDBVpc
+  DDBVpcIsolatedSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DDBVpcIsolatedSubnet2RouteTable
+      SubnetId: !Ref DDBVpcIsolatedSubnet2Subnet
+  KinesisEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Kinesis Endpoint
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt DDBVpc.CidrBlock
+          Description: !Sub from ${DDBVpc.CidrBlock}:443
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref DDBVpc
+  KinesisEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kinesis-firehose
+      VpcId: !Ref DDBVpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt KinesisEndpointSecurityGroup.GroupId
+      SubnetIds:
+        - !Ref DDBVpcIsolatedSubnet1Subnet
+        - !Ref DDBVpcIsolatedSubnet2Subnet
+      VpcEndpointType: Interface
+  STSEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for STS Enpoint
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt DDBVpc.CidrBlock
+          Description: !Sub from ${DDBVpc.CidrBlock}:443
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref DDBVpc
+  STSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      VpcId: !Ref DDBVpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt STSEndpointSecurityGroup.GroupId
+      SubnetIds:
+        - !Ref DDBVpcIsolatedSubnet1Subnet
+        - !Ref DDBVpcIsolatedSubnet2Subnet
+      VpcEndpointType: Interface
+  KMSEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for KMS Enpoint
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt DDBVpc.CidrBlock
+          Description: !Sub from ${DDBVpc.CidrBlock}:443
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref DDBVpc
+  KMSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kms
+      VpcId: !Ref DDBVpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt KMSEndpointSecurityGroup.GroupId
+      SubnetIds:
+        - !Ref DDBVpcIsolatedSubnet1Subnet
+        - !Ref DDBVpcIsolatedSubnet2Subnet
+      VpcEndpointType: Interface
+  CWEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Cloud Watch VPC Endpoints
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt DDBVpc.CidrBlock
+          Description: !Sub from ${DDBVpc.CidrBlock}:443
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      VpcId: !Ref DDBVpc
+  CWEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.monitoring
+      VpcId: !Ref DDBVpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !GetAtt CWEndpointSecurityGroup.GroupId
+      SubnetIds:
+        - !Ref DDBVpcIsolatedSubnet1Subnet
+        - !Ref DDBVpcIsolatedSubnet2Subnet
+      VpcEndpointType: Interface
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref DDBVpc
+      RouteTableIds:
+        - !Ref DDBVpcIsolatedSubnet1RouteTable
+        - !Ref DDBVpcIsolatedSubnet2RouteTable
+      VpcEndpointType: Gateway
+  BlogTransformationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: blog-srca-trans-lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+  BlogTransformationLambdaDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: cloudwatch:PutMetricData
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey*
+            Effect: Allow
+            Resource: !GetAtt DatalakeKmsKey.Arn
+        Version: '2012-10-17'
+      PolicyName: BlogTransformationLambdaRoleDefaultPolicy
+      Roles:
+        - !Ref BlogTransformationLambdaRole
+  BlogTransformationLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Automatic security group for Lambda Function
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      VpcId: !Ref DDBVpc
+  BlogTransformationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/blog-srca-firehose-transformation-lambda
+  BlogTransformationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref BlogTransformationLambdaFile
+      Handler: firehose_transformation_lambda.lambda_handler
+      Role: !GetAtt BlogTransformationLambdaRole.Arn
+      Runtime: python3.6
+      FunctionName: blog-srca-firehose-transformation-lambda
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt BlogTransformationLambdaSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref DDBVpcIsolatedSubnet1Subnet
+          - !Ref DDBVpcIsolatedSubnet2Subnet
+    DependsOn:
+      - BlogTransformationLambdaDefaultPolicy
+      - BlogTransformationLambdaLogGroup
+  FirehoseDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: blog-srca-dstream-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+        Version: '2012-10-17'
+      Description: Role for Firehose stream to receive data
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:*
+            Version: '2012-10-17'
+          PolicyName: AllowLogging
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Effect: Allow
+                Resource:
+                  - !GetAtt DatalakeKmsKey.Arn
+                  - !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${ConsumerAccountID}:key/*
+            Version: '2012-10-17'
+          PolicyName: kms
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                  - s3:ListBucketByTags
+                  - s3:GetBucketLocation
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CrossAccountDatalakeBucket}
+            Version: '2012-10-17'
+          PolicyName: s3Permissions1
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:PutObject
+                  - s3:ListObjects
+                  - s3:PutObjectAcl
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CrossAccountDatalakeBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${CrossAccountDatalakeBucket}/*
+            Version: '2012-10-17'
+          PolicyName: s3Permissions2
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Effect: Allow
+                Resource: !GetAtt BlogTransformationLambda.Arn
+            Version: '2012-10-17'
+          PolicyName: lambdaPermissions
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Effect: Allow
+                Resource: !GetAtt BlogKinesisStream.Arn
+            Version: '2012-10-17'
+          PolicyName: KinesisPermissions
+  DDBStreamReceiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/kinesisfirehose/blog-ddbstream-receiver-blog_datalake-log-group
+  DDBStreamReceiverLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref DDBStreamReceiverLogGroup
+      LogStreamName: S3Delivery
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: blog-srca-ddb-table-delivery-stream
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt BlogKinesisStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryStreamRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:${AWS::Partition}:s3:::${CrossAccountDatalakeBucket}
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: /aws/kinesisfirehose/blog-ddbstream-receiver-blog_datalake-log-group
+          LogStreamName: S3Delivery
+        CompressionFormat: UNCOMPRESSED
+        ErrorOutputPrefix: error/blog-srca-ddb-table/
+        Prefix: blog-srca-ddb-table/dt=!{timestamp:yyyy-MM-dd/}
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt BlogTransformationLambda.Arn
+                - ParameterName: NumberOfRetries
+                  ParameterValue: '2'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+        RoleARN: !GetAtt FirehoseDeliveryStreamRole.Arn
